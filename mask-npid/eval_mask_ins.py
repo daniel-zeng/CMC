@@ -9,6 +9,7 @@ from __future__ import print_function
 
 import os
 import sys
+sys.path.append('./')
 import time
 import torch
 import torch.optim as optim
@@ -24,9 +25,10 @@ import tensorboard_logger as tb_logger
 from torchvision import transforms, datasets
 from util import adjust_learning_rate, AverageMeter
 
-from models.resnet import InsResNet50
+from models.resnet import InsResNet50, MaskInsResNet50, MaskConvInsResNet50
 from models.LinearModel import LinearClassifierResNet
 
+import pdb
 
 def parse_option():
 
@@ -85,6 +87,8 @@ def parse_option():
   parser.add_argument('--data_folder', type=str, default=None, help='path to data')
   parser.add_argument('--save_path', type=str, default=None, help='path to save model')
   parser.add_argument('--tb_path', type=str, default=None, help='path to tensorboard')
+
+  parser.add_argument('--extract', type=int, default=0, help='If to do extraction mode')
 
   opt = parser.parse_args()
 
@@ -150,7 +154,7 @@ def main():
   val_folder = os.path.join(args.data_folder, 'val')
 
   image_size = 224
-  crop_padding = 32
+  crop_padding = 0 #32
   mean = [0.485, 0.456, 0.406]
   std = [0.229, 0.224, 0.225]
   normalize = transforms.Normalize(mean=mean, std=std)
@@ -197,7 +201,7 @@ def main():
 
   # create model and optimizer
   if args.model == 'resnet50':
-    model = InsResNet50()
+    model = MaskConvInsResNet50()
     classifier = LinearClassifierResNet(args.layer, args.n_label, 'avg', 1)
   elif args.model == 'resnet50x2':
     model = InsResNet50(width=2)
@@ -214,8 +218,11 @@ def main():
   print("==> loaded checkpoint '{}' (epoch {})".format(args.model_path, ckpt['epoch']))
   print('==> done')
 
-  model = model.cuda()
-  classifier = classifier.cuda()
+  device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+  if torch.cuda.device_count() > 1:
+    print("Using", torch.cuda.device_count(), "GPUs")
+  model = model.to(device)
+  classifier = classifier.to(device)
 
   criterion = torch.nn.CrossEntropyLoss().cuda(args.gpu)
 
@@ -291,90 +298,103 @@ def main():
   logger = tb_logger.Logger(logdir=args.tb_folder, flush_secs=2)
 
   # routine
-  for epoch in range(args.start_epoch, args.epochs + 1):
-    break
+  if not args.extract:
+    for epoch in range(args.start_epoch, args.epochs + 1):
 
-    if args.cosine:
-      scheduler.step()
-    else:
-      adjust_learning_rate(epoch, args, optimizer)
-    print("==> training...")
+      if args.cosine:
+        scheduler.step()
+      else:
+        adjust_learning_rate(epoch, args, optimizer)
+      print("==> training...")
 
-    time1 = time.time()
-    train_acc, train_acc5, train_loss = train(epoch, train_loader, model, classifier, criterion, optimizer, args)
-    time2 = time.time()
-    print('train epoch {}, total time {:.2f}'.format(epoch, time2 - time1))
+      time1 = time.time()
+      train_acc, train_acc5, train_loss = train(epoch, train_loader, model, classifier, criterion, optimizer, args)
+      time2 = time.time()
+      print('train epoch {}, total time {:.2f}'.format(epoch, time2 - time1))
 
-    logger.log_value('train_acc', train_acc, epoch)
-    logger.log_value('train_acc5', train_acc5, epoch)
-    logger.log_value('train_loss', train_loss, epoch)
-    logger.log_value('learning_rate', optimizer.param_groups[0]['lr'], epoch)
+      logger.log_value('train_acc', train_acc, epoch)
+      logger.log_value('train_acc5', train_acc5, epoch)
+      logger.log_value('train_loss', train_loss, epoch)
+      logger.log_value('learning_rate', optimizer.param_groups[0]['lr'], epoch)
 
-    print("==> testing...")
-    test_acc, test_acc5, test_loss = validate(val_loader, model, classifier, criterion, args)
+      print("==> testing...")
+      test_acc, test_acc5, test_loss = validate(val_loader, model, classifier, criterion, args)
 
-    logger.log_value('test_acc', test_acc, epoch)
-    logger.log_value('test_acc5', test_acc5, epoch)
-    logger.log_value('test_loss', test_loss, epoch)
+      logger.log_value('test_acc', test_acc, epoch)
+      logger.log_value('test_acc5', test_acc5, epoch)
+      logger.log_value('test_loss', test_loss, epoch)
 
-    # save the best model
-    if test_acc > best_acc1:
-      best_acc1 = test_acc
-      state = {
-        'opt': args,
-        'epoch': epoch,
-        'classifier': classifier.state_dict(),
-        'best_acc1': best_acc1,
-        'optimizer': optimizer.state_dict(),
-      }
-      save_name = '{}_layer{}.pth'.format(args.model, args.layer)
-      save_name = os.path.join(args.save_folder, save_name)
-      print('saving best model!')
-      torch.save(state, save_name)
+      # save the best model
+      if test_acc > best_acc1:
+        best_acc1 = test_acc
+        state = {
+          'opt': args,
+          'epoch': epoch,
+          'classifier': classifier.state_dict(),
+          'best_acc1': best_acc1,
+          'optimizer': optimizer.state_dict(),
+        }
+        save_name = '{}_layer{}.pth'.format(args.model, args.layer)
+        save_name = os.path.join(args.save_folder, save_name)
+        print('saving best model!')
+        torch.save(state, save_name)
 
-    # save model
-    if epoch % args.save_freq == 0:
-      print('==> Saving...')
-      state = {
-        'opt': args,
-        'epoch': epoch,
-        'classifier': classifier.state_dict(),
-        'best_acc1': test_acc,
-        'optimizer': optimizer.state_dict(),
-      }
-      save_name = 'ckpt_epoch_{epoch}.pth'.format(epoch=epoch)
-      save_name = os.path.join(args.save_folder, save_name)
-      print('saving regular model!')
-      torch.save(state, save_name)
+      # save model
+      if epoch % args.save_freq == 0:
+        print('==> Saving...')
+        state = {
+          'opt': args,
+          'epoch': epoch,
+          'classifier': classifier.state_dict(),
+          'best_acc1': test_acc,
+          'optimizer': optimizer.state_dict(),
+        }
+        save_name = 'ckpt_epoch_{epoch}.pth'.format(epoch=epoch)
+        save_name = os.path.join(args.save_folder, save_name)
+        print('saving regular model!')
+        torch.save(state, save_name)
 
-    # tensorboard logger
-    pass
+      # tensorboard logger
+      pass
 
-  
+  if not args.extract:
+    return
+
   # now compute and output embeddings
-  import pdb
-  embeddings = None
-  train_loader_embed = torch.utils.data.DataLoader(
-    train_dataset, batch_size=args.batch_size, shuffle=False,
-    num_workers=args.num_workers, pin_memory=False)
-  train_loader_embed.dataset.transform = val_loader.dataset.transform
-  shape = [len(train_dataset)]
-  og_bs = args.batch_size
-  
-  for batch_idx, (inputs, labels) in enumerate(train_loader_embed):
-    batchSize = inputs.size(0)
+  for folder, name in [(train_folder, "train"), (val_folder, "val")]:
+    print(folder)
+    embeddings = None
+    embeddings_mask = None
     
-    with torch.no_grad():
-      outputs = model(inputs, args.layer).detach()
-    if embeddings is None:
-      shape += outputs.shape[1:]
-      embeddings = torch.zeros(shape).cpu()
+    loader_embed = torch.utils.data.DataLoader(
+      datasets.ImageFolder(folder, val_dataset.transform), batch_size=args.batch_size, 
+      shuffle=False, num_workers=args.num_workers, pin_memory=False)
+    shape = [len(loader_embed.dataset)]
+    shape_mask = [len(loader_embed.dataset)]
+    og_bs = args.batch_size
+    
+    for batch_idx, (inputs, labels) in enumerate(loader_embed):
+      batchSize = inputs.size(0)
+      
+      with torch.no_grad():
+        outputs, masks = model(inputs, (1, 1), args.layer)
+        outputs = outputs.detach()
+        masks = masks.squeeze(-1).reshape(-1, 7, 7).detach()
+      if embeddings is None:
+        shape += outputs.shape[1:]
+        shape_mask += masks.shape[1:]
+        embeddings = torch.zeros(shape).cpu()
+        embeddings_mask = torch.zeros(shape_mask).cpu()
 
-    
-    embeddings[batch_idx * og_bs : batch_idx * og_bs + batchSize] = outputs.data
-    if batch_idx % 100 == 0:
-      print(batch_idx)
-  torch.save(embeddings, "npid_embeds.pt")
+      embeddings[batch_idx * og_bs : batch_idx * og_bs + batchSize] = outputs.data
+      embeddings_mask[batch_idx * og_bs : batch_idx * og_bs + batchSize] = masks.data
+      if batch_idx % 100 == 0:
+        print(batch_idx)
+    torch.save(embeddings, "npid_mask_embeds_{}.pt".format(name))
+    torch.save(embeddings_mask, "npid_mask_embeds_masks_{}.pt".format(name))
+    print("Done - {}".format(name), embeddings.shape, embeddings_mask.shape)
+    del embeddings
+    del embeddings_mask
 
 
 def set_lr(optimizer, lr):
@@ -411,7 +431,7 @@ def train(epoch, train_loader, model, classifier, criterion, optimizer, opt):
 
     # ===================forward=====================
     with torch.no_grad():
-      feat = model(input, opt.layer)
+      feat, _ = model(input, (1, 1), opt.layer)
       feat = feat.detach()
 
     output = classifier(feat)
@@ -466,7 +486,7 @@ def validate(val_loader, model, classifier, criterion, opt):
       target = target.cuda(opt.gpu, non_blocking=True)
 
       # compute output
-      feat = model(input, opt.layer)
+      feat, _ = model(input, (1, 1), opt.layer)
       feat = feat.detach()
       output = classifier(feat)
       loss = criterion(output, target)

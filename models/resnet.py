@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import math
 import numpy as np
+import pdb
 import torch.utils.model_zoo as model_zoo
 
 __all__ = ['ResNet', 'resnet18', 'resnet34', 'resnet50', 'resnet101',
@@ -246,6 +247,138 @@ class InsResNet50(nn.Module):
 
     def forward(self, x, layer=7):
         return self.encoder(x, layer)
+
+class MaskBlock(nn.Module):
+    def __init__(self, fc_dims, in_dim=2048):
+        super(MaskBlock, self).__init__()
+        
+        self.fcs = nn.ModuleList([]) # Need to do this so fcs are moved to GPU on .to(device)
+        fc_dims.insert(0, in_dim)
+        for fc_dim_i in range(len(fc_dims) - 1):
+            self.fcs.append(nn.Linear(fc_dims[fc_dim_i], fc_dims[fc_dim_i + 1]))
+        self.last_fc = nn.Linear(fc_dims[-1], 1)
+
+        self.relu = nn.ReLU()
+        self.sigm = nn.Sigmoid()
+
+    def forward(self, x):
+        out = x.permute(0, 2, 3, 1)
+        
+        for layer in self.fcs:
+            out = layer(out)    
+            out = self.relu(out)
+
+        out = self.last_fc(out)
+        out = self.sigm(out)
+
+        return out
+
+class MaskBlockConv(nn.Module):
+    def __init__(self, filter_dims, use_bn=True, in_dim=2048):
+        super(MaskBlockConv, self).__init__()
+        
+        self.fcs = nn.ModuleList([]) # Need to do this so fcs are moved to GPU on .to(device)
+        self.bns = nn.ModuleList([])
+        filter_dims.insert(0, in_dim)
+        for i in range(len(filter_dims) - 1):
+            self.fcs.append(nn.Conv2d(filter_dims[i], filter_dims[i + 1], kernel_size=3, stride=1, padding=1))
+            if use_bn:
+                self.bns.append(nn.BatchNorm2d(filter_dims[i + 1]))
+
+        self.last_fc = nn.Conv2d(filter_dims[-1], 1, kernel_size=3, stride=1, padding=1)
+
+        self.relu = nn.ReLU()
+        self.sigm = nn.Sigmoid()
+
+        self.use_bn = use_bn
+
+    def forward(self, x):
+        out = x
+        
+        if self.use_bn:
+            for layer, bnl in zip(self.fcs, self.bns):
+                out = layer(out)
+                out = bnl(out)
+                out = self.relu(out)
+        else:
+            for layer in self.fcs:
+                out = layer(out)    
+                out = self.relu(out)
+
+        out = self.last_fc(out)
+        out = self.sigm(out)
+
+        out = out.permute(0, 2, 3, 1)
+
+        return out
+
+class MaskedEncoder(nn.Module):
+    def __init__(self, encoder, mask_block):
+        super(MaskedEncoder, self).__init__()
+        self.encoder = encoder
+        self.mask = mask_block
+        # self.sm = nn.Softmax(dim=1)
+    
+    def forward(self, x, aux, layer):
+        if layer <= 5:
+            return self.encoder(x, layer)
+
+        out = self.encoder(x, layer=5) #N x 7 x 7 x 2048
+        mask = self.mask(out) #N x 7 x 7 x 1
+    
+        mask = mask.view(mask.size(0), -1, mask.size(3)) # N x 49 x 1
+        # mask = self.sm(mask)
+        # pdb.set_trace()
+        out = out.view(out.size(0), out.size(1), -1) # N x 2048 x 49
+
+        masked_out = torch.matmul(out, mask).squeeze(-1) # N x 2048
+        
+        idx, epoch = aux
+        if idx == 0: #and (epoch > 8 or epoch == 4 or epoch == 1):
+            print(mask[0])
+            # pdb.set_trace()
+            # see if masked_out is too small
+        
+        # what happens if this?
+        mask_sum = torch.sum(mask, dim=1)
+        masked_out /= torch.max(mask_sum, torch.ones_like(mask_sum) * 0.001)
+
+        # masked out if weighted average pool
+        if layer == 6:
+            return masked_out, mask
+        
+        masked_out = self.encoder.fc(masked_out)
+        masked_out = self.encoder.l2norm(masked_out)
+
+        return masked_out
+
+
+class MaskInsResNet50(nn.Module):
+    """Encoder for mask instance discrimination and MoCo"""
+    def __init__(self, width=1):
+        super(MaskInsResNet50, self).__init__()
+        self.resnet = resnet50(width=width)
+        self.mask_block = MaskBlock([1000, 250], 2048)
+        
+        self.masked_encoder = MaskedEncoder(self.resnet, self.mask_block)
+        self.encoder = nn.DataParallel(self.masked_encoder)
+        
+    def forward(self, x, layer=7):
+        return self.encoder(x, layer)
+
+
+class MaskConvInsResNet50(nn.Module):
+    """Encoder for mask instance discrimination and MoCo"""
+    def __init__(self, width=1):
+        super(MaskConvInsResNet50, self).__init__()
+        self.resnet = resnet50(width=width)
+        self.mask_block = MaskBlockConv([1000, 250], True, 2048)
+        
+        self.masked_encoder = MaskedEncoder(self.resnet, self.mask_block)
+        self.encoder = nn.DataParallel(self.masked_encoder)
+        
+    def forward(self, x, aux, layer=7):
+        return self.encoder(x, aux, layer)
 
 
 class ResNetV1(nn.Module):

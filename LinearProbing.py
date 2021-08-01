@@ -21,7 +21,7 @@ from models.alexnet import MyAlexNetCMC
 from models.resnet import MyResNetsCMC
 from models.LinearModel import LinearClassifierAlexNet, LinearClassifierResNet
 
-from spawn import spawn
+# from spawn import spawn
 
 
 def parse_option():
@@ -187,12 +187,16 @@ def set_model(args):
     print("==> loaded checkpoint '{}' (epoch {})".format(args.model_path, ckpt['epoch']))
     print('==> done')
 
+    # if torch.cuda.device_count() > 1:
+    #     print("Using", torch.cuda.device_count(), "GPUs")
+    #     model = nn.DataParallel(model) 
+    # model.to("cuda")
     model = model.cuda()
     classifier = classifier.cuda()
 
     model.eval()
 
-    criterion = nn.CrossEntropyLoss().cuda(args.gpu)
+    criterion = nn.CrossEntropyLoss().cuda()
 
     return model, classifier, criterion
 
@@ -378,6 +382,7 @@ def main():
 
     # routine
     for epoch in range(args.start_epoch, args.epochs + 1):
+        break
 
         adjust_learning_rate(epoch, args, optimizer)
         print("==> training...")
@@ -430,6 +435,33 @@ def main():
 
         # tensorboard logger
         pass
+
+    # now compute and output embeddings
+    import pdb
+    embeddings = None
+    train_loader_embed = torch.utils.data.DataLoader(
+        train_loader.dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=False)
+    train_loader_embed.dataset.transform = val_loader.dataset.transform
+    shape = [len(train_loader.dataset)]
+    og_bs = args.batch_size
+    
+    for batch_idx, (inputs, labels) in enumerate(train_loader_embed):
+        batchSize = inputs.size(0)
+        
+        with torch.no_grad():
+            feat_l, feat_ab = model(inputs.float(), args.layer)
+            outputs = torch.cat((feat_l.detach(), feat_ab.detach()), dim=1)
+
+        if embeddings is None:
+            shape += outputs.shape[1:]
+            embeddings = torch.zeros(shape).cpu()
+
+        
+        embeddings[batch_idx * og_bs : batch_idx * og_bs + batchSize] = outputs.data
+        if batch_idx % 100 == 0:
+            print(batch_idx)
+    torch.save(embeddings, "cmc_embeds.pt")
 
 
 if __name__ == '__main__':

@@ -9,6 +9,8 @@ from __future__ import print_function
 
 import os
 import sys
+sys.path.append('./')
+
 import time
 import torch
 import torch.backends.cudnn as cudnn
@@ -20,7 +22,7 @@ import tensorboard_logger as tb_logger
 from torchvision import transforms, datasets
 from util import adjust_learning_rate, AverageMeter
 
-from models.resnet import InsResNet50
+from models.resnet import InsResNet50, MaskInsResNet50, MaskConvInsResNet50
 from NCE.NCEAverage import MemoryInsDis
 from NCE.NCEAverage import MemoryMoCo
 from NCE.NCECriterion import NCECriterion
@@ -38,6 +40,7 @@ except ImportError:
 TODO: python 3.6 ModuleNotFoundError
 """
 
+device = ""
 
 def parse_option():
 
@@ -54,6 +57,7 @@ def parse_option():
 
     # optimization
     parser.add_argument('--learning_rate', type=float, default=0.03, help='learning rate')
+    parser.add_argument('--mask_learning_rate', type=float, default=0.03, help='learning rate')
     parser.add_argument('--lr_decay_epochs', type=str, default='120,160,200', help='where to decay lr, can be a list')
     parser.add_argument('--lr_decay_rate', type=float, default=0.1, help='decay rate for learning rate')
     parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for adam')
@@ -123,8 +127,8 @@ def parse_option():
     opt.method = 'softmax' if opt.softmax else 'nce'
     prefix = 'MoCo{}'.format(opt.alpha) if opt.moco else 'InsDis'
 
-    opt.model_name = '{}_{}_{}_{}_lr_{}_decay_{}_bsz_{}_crop_{}'.format(prefix, opt.method, opt.nce_k, opt.model,
-                                                                        opt.learning_rate, opt.weight_decay,
+    opt.model_name = '{}_{}_{}_{}_lr_{}_masklr_{}_decay_{}_bsz_{}_crop_{}'.format(prefix, opt.method, opt.nce_k, opt.model,
+                                                                        opt.learning_rate, opt.mask_learning_rate, opt.weight_decay,
                                                                         opt.batch_size, opt.crop)
 
     if opt.warm:
@@ -161,11 +165,16 @@ def get_shuffle_ids(bsz):
 
 
 def main():
-
     args = parse_option()
+    print("Train Mask NPID")
 
     if args.gpu is not None:
         print("Use GPU: {} for training".format(args.gpu))
+
+    global device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.device_count() > 1:
+        print("Using", torch.cuda.device_count(), "GPUs")
 
     # set the data loader
     data_folder = os.path.join(args.data_folder, 'train')
@@ -199,15 +208,15 @@ def main():
     train_sampler = None
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.num_workers, pin_memory=True, sampler=train_sampler)
+        num_workers=args.num_workers, sampler=train_sampler)
 
     # create model and optimizer
     n_data = len(train_dataset)
 
     if args.model == 'resnet50':
-        model = InsResNet50()
+        model = MaskConvInsResNet50()
         if args.moco:
-            model_ema = InsResNet50()
+            model_ema = MaskConvInsResNet50()
     elif args.model == 'resnet50x2':
         model = InsResNet50(width=2)
         if args.moco:
@@ -225,20 +234,22 @@ def main():
 
     # set the contrast memory and criterion
     if args.moco:
-        contrast = MemoryMoCo(128, n_data, args.nce_k, args.nce_t, args.softmax).cuda(args.gpu)
+        contrast = MemoryMoCo(128, n_data, args.nce_k, args.nce_t, args.softmax).to(device)
     else:
-        contrast = MemoryInsDis(128, n_data, args.nce_k, args.nce_t, args.nce_m, args.softmax).cuda(args.gpu)
+        contrast = MemoryInsDis(128, n_data, args.nce_k, args.nce_t, args.nce_m, args.softmax).to(device)
 
     criterion = NCESoftmaxLoss() if args.softmax else NCECriterion(n_data)
-    criterion = criterion.cuda(args.gpu)
+    criterion = criterion.to(device)
 
-    pdb.set_trace()
-
-    model = model.cuda()
+    model = model.to(device)
     if args.moco:
-        model_ema = model_ema.cuda()
+        model_ema = model_ema.to(device)
 
-    optimizer = torch.optim.SGD(model.parameters(),
+    optimizer = torch.optim.SGD(
+                                [
+                                {"params": model.resnet.parameters(), "lr": args.learning_rate},
+                                {"params": model.mask_block.parameters(), "lr": args.mask_learning_rate},
+                                ],
                                 lr=args.learning_rate,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
@@ -361,15 +372,15 @@ def train_ins(epoch, train_loader, model, contrast, criterion, optimizer, opt):
 
         bsz = inputs.size(0)
 
-        inputs = inputs.float()
         if opt.gpu is not None:
             inputs = inputs.cuda(opt.gpu, non_blocking=True)
         else:
-            inputs = inputs.cuda()
-        index = index.cuda(opt.gpu, non_blocking=True)
+            inputs = inputs.to(device)
+        inputs = inputs.float()
+        index = index.to(device)
 
         # ===================forward=====================
-        feat = model(inputs)
+        feat = model(inputs, (idx, epoch))
         out = contrast(feat, index)
 
         loss = criterion(out)
@@ -401,7 +412,6 @@ def train_ins(epoch, train_loader, model, contrast, criterion, optimizer, opt):
                   'prob {prob.val:.3f} ({prob.avg:.3f})'.format(
                    epoch, idx + 1, len(train_loader), batch_time=batch_time,
                    data_time=data_time, loss=loss_meter, prob=prob_meter))
-            print(out.shape)
             sys.stdout.flush()
 
     return loss_meter.avg, prob_meter.avg
@@ -484,7 +494,6 @@ def train_moco(epoch, train_loader, model, model_ema, contrast, criterion, optim
                   'prob {prob.val:.3f} ({prob.avg:.3f})'.format(
                    epoch, idx + 1, len(train_loader), batch_time=batch_time,
                    data_time=data_time, loss=loss_meter, prob=prob_meter))
-            print(out.shape)
             sys.stdout.flush()
 
     return loss_meter.avg, prob_meter.avg
